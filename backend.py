@@ -49,23 +49,86 @@ async def read_index():
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    if not model and (not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here"):
+    if not model and not gemini_client:
         return {"error": "Neither Local Model nor Gemini API is available."}
     
     content = await file.read()
     image = Image.open(io.BytesIO(content)).convert("RGB")
     
-    # Try Gemini API First
+    local_predicted_class = "Unknown"
+    local_specific_item = "Unknown Item"
+    local_freshness_percentage = 0
+    local_model_success = False
+    
+    # 1. Primary pass: Run Local Model First
+    if model:
+        try:
+            # Preprocess image for model (matching app.py specs: 240x240, normalize)
+            img_resized = image.resize((240, 240))
+            img_array = np.array(img_resized) / 255.0
+            img_array = np.expand_dims(img_array, axis=0)
+            
+            # Predict
+            predictions = model.predict(img_array)[0]
+            
+            # Exact mapping from the notebook's training data:
+            class_names = [
+                'Fresh Orange', 'Rotten Apple', 'Fresh Banana', 
+                'Rotten Orange', 'Fresh Apple', 'Rotten Banana'
+            ]
+        
+            if len(predictions) == 6:
+                fresh_conf = float(predictions[0] + predictions[2] + predictions[4])
+                rotten_conf = float(predictions[1] + predictions[3] + predictions[5])
+                
+                max_idx = int(np.argmax(predictions))
+                local_specific_item = class_names[max_idx]
+            else:
+                fresh_conf = float(predictions[0])
+                rotten_conf = float(predictions[1])
+                local_specific_item = "Unknown Item"
+            
+            local_predicted_class = "Fresh" if fresh_conf >= rotten_conf else "Rotten"
+            local_freshness_percentage = int(fresh_conf * 100)
+            
+            # Dynamic low score calculation
+            if local_predicted_class == "Rotten" and local_freshness_percentage < 10:
+                pseudo_random_variance = int((rotten_conf * 10000) % 25)
+                local_freshness_percentage = 8 + pseudo_random_variance
+                
+            if local_freshness_percentage < 50:
+                local_predicted_class = "Rotten"
+                
+            local_model_success = True
+        except Exception as e:
+            print(f"Local model prediction failed: {e}")
+
+    # Set base results
+    final_predicted_class = local_predicted_class
+    final_specific_item = local_specific_item
+    final_freshness_percentage = local_freshness_percentage
+    
+    # 2. Secondary pass: Gemini API for Validation & Accuracy Enhancement
     if gemini_client:
         try:
-            prompt = """Analyze this image of a fruit and respond ONLY with a JSON object.
+            if local_model_success:
+                prompt = f"""Our local CNN fruit model analyzed this image and predicted it as a "{local_specific_item}" with an overall status of "{local_predicted_class}" and a freshness score of {local_freshness_percentage}/100.
+                
+Please perform a visual analysis to validate or correct this prediction to increase the final accuracy. Look closely at the fruit's physical signs of decay, mold, bruising, or perfect ripeness. 
+
+Respond ONLY with a JSON object. Do not wrap it in markdown block quotes. Just the raw JSON.
+The JSON must have the following keys:
+- "predicted_class": string, either "Fresh" or "Rotten"
+- "specific_item": string, e.g., "Fresh Apple", "Rotten Banana", "Fresh Orange", etc.
+- "freshness_score": integer between 0 and 100 representing the freshness percentage.
+"""
+            else:
+                prompt = """Analyze this image of a fruit and respond ONLY with a JSON object.
 Do not wrap it in markdown block quotes. Just the raw JSON.
 The JSON must have the following keys:
 - "predicted_class": string, either "Fresh" or "Rotten"
 - "specific_item": string, e.g., "Fresh Apple", "Rotten Banana", "Fresh Orange", etc.
 - "freshness_score": integer between 0 and 100 representing the freshness percentage.
-
-Consider physical signs of decay, mold, bruising, or perfect ripeness when evaluating.
 """
             response = gemini_client.models.generate_content(
                 model='gemini-2.5-flash',
@@ -74,76 +137,25 @@ Consider physical signs of decay, mold, bruising, or perfect ripeness when evalu
             response_text = response.text.replace("```json\n", "").replace("\n```", "").strip()
             gemini_data = json.loads(response_text)
             
-            predicted_class = gemini_data.get("predicted_class", "Fresh")
-            specific_item = gemini_data.get("specific_item", "Unknown Item")
-            freshness_percentage = int(gemini_data.get("freshness_score", 0))
+            # Adopt Gemini's validated findings
+            final_predicted_class = gemini_data.get("predicted_class", final_predicted_class)
+            final_specific_item = gemini_data.get("specific_item", final_specific_item)
+            final_freshness_percentage = int(gemini_data.get("freshness_score", final_freshness_percentage))
             
-            # Use Gemini's results directly to proceed to the sublabels
-            pass_to_sublabels = True
         except Exception as e:
-            print(f"Gemini API failed: {e}. Falling back to local model.")
-            pass_to_sublabels = False
-    else:
-        pass_to_sublabels = False
-        
-    # Local Model Fallback
-    if not pass_to_sublabels:
-        # Preprocess image for model (matching app.py specs: 240x240, normalize)
-        img_resized = image.resize((240, 240))
-        img_array = np.array(img_resized) / 255.0
-        img_array = np.expand_dims(img_array, axis=0)
-        
-        # Predict
-        predictions = model.predict(img_array)[0]
-        
-        # Exact mapping from the notebook's training data:
-        # ['freshoranges', 'rottenapples', 'freshbanana', 'rottenoranges', 'freshapples', 'rottenbanana']
-        class_names = [
-            'Fresh Orange', 
-            'Rotten Apple', 
-            'Fresh Banana', 
-            'Rotten Orange', 
-        'Fresh Apple', 
-        'Rotten Banana'
-    ]
-    
-        if len(predictions) == 6:
-            # Fresh indices: 0 (Orange), 2 (Banana), 4 (Apple)
-            fresh_conf = float(predictions[0] + predictions[2] + predictions[4])
-            # Rotten indices: 1 (Apple), 3 (Orange), 5 (Banana)
-            rotten_conf = float(predictions[1] + predictions[3] + predictions[5])
-            
-            max_idx = int(np.argmax(predictions))
-            specific_item = class_names[max_idx]
-        else:
-            fresh_conf = float(predictions[0])
-            rotten_conf = float(predictions[1])
-            specific_item = "Unknown Item"
-        
-        predicted_class = "Fresh" if fresh_conf >= rotten_conf else "Rotten"
-        
-        # Calculate freshness percentage
-        freshness_percentage = int(fresh_conf * 100)
-        
-        # User requested to avoid always showing exactly 0% for very rotten fruits.
-        # We will generate a realistic dynamic low score (e.g. 12% - 35%) so it doesn't look static.
-        if predicted_class == "Rotten" and freshness_percentage < 10:
-            # Use the micro-decimals of the probability to create a perfectly reproducible but varied score 
-            pseudo_random_variance = int((rotten_conf * 10000) % 25)
-            freshness_percentage = 8 + pseudo_random_variance
-            
-        # Safeguard for UI
-        if freshness_percentage < 50:
-            predicted_class = "Rotten"
-            
-    # Calculate more accurate recommendations
-    if freshness_percentage >= 80:
+            print(f"Gemini Validation failed: {e}. Falling back purely to local model results.")
+
+    if not local_model_success and not gemini_client:
+        return {"error": "Prediction pipeline failed. Both local model and Gemini API are unavailable."}
+
+    # Calculate more accurate recommendations based on the final validated data
+    if final_freshness_percentage >= 80:
         shelf_life = "Eat within 5-7 days"
         shelf_subtitle = "Store in crisper drawer"
         best_for = "Fresh Eating"
         best_subtitle = "Texture confirmed"
         status_color = "#16a34a"  # green
-    elif freshness_percentage >= 50:
+    elif final_freshness_percentage >= 50:
         shelf_life = "Consume soon"
         shelf_subtitle = "Keep refrigerated"
         best_for = "Baking / Smoothies"
@@ -158,9 +170,9 @@ Consider physical signs of decay, mold, bruising, or perfect ripeness when evalu
         
     return {
         "status": "success",
-        "predicted_class": predicted_class,
-        "specific_item": specific_item,
-        "freshness_score": freshness_percentage,
+        "predicted_class": final_predicted_class,
+        "specific_item": final_specific_item,
+        "freshness_score": final_freshness_percentage,
         "details": {
             "shelf_life": shelf_life,
             "shelf_subtitle": shelf_subtitle,
